@@ -1,6 +1,6 @@
 -- AuraFilter.lua
 -- Filtert Debuffs auf dem Target Frame
--- Unterstützt drei Modi: onlyMine | whitelist | blacklist
+-- Midnight 12.0 kompatibel: pcall um alle Aura-Datenzugriffe (Secret Values)
 -- Slash: /af  oder  /aurafilter
 
 local addonName, addon = ...
@@ -10,6 +10,7 @@ local addonName, addon = ...
 -- ---------------------------------------------------------------------------
 local defaults = {
     enabled    = true,
+    secretFallback = "hide",   -- Was tun wenn Daten secret sind: "hide" | "show"
     targetDebuffs = {
         mode      = "onlyMine",  -- "onlyMine" | "whitelist" | "blacklist" | "all"
         whitelist = {},          -- [spellID] = "Name"  → nur diese zeigen
@@ -31,75 +32,138 @@ local function ApplyDefaults(target, src)
 end
 
 -- ---------------------------------------------------------------------------
--- Aura-Filter Logik
+-- Sicheres Lesen von Aura-Feldern (Secret Values → pcall)
 -- ---------------------------------------------------------------------------
 
--- Gibt zurück ob eine Aura angezeigt werden soll
+-- Liest einen Wert sicher aus einer Aura-Tabelle.
+-- Gibt nil zurück wenn der Wert ein Secret ist.
+local function SafeGet(aura, field)
+    local ok, val = pcall(function() return aura[field] end)
+    if not ok then return nil end
+    -- Secret Values sind kein string/number → noch mal prüfen
+    local ok2 = pcall(function()
+        local _ = tostring(val) == tostring(val)
+    end)
+    if not ok2 then return nil end
+    return val
+end
+
+-- ---------------------------------------------------------------------------
+-- Filter-Entscheidung
+-- ---------------------------------------------------------------------------
 local function ShouldShowDebuff(spellId, sourceUnit)
-    local cfg = AuraFilterDB.targetDebuffs
+    local cfg  = AuraFilterDB.targetDebuffs
     local mode = cfg.mode
 
     if mode == "all" then
         return true
 
     elseif mode == "onlyMine" then
+        if sourceUnit == nil then
+            -- Secret → Fallback-Einstellung anwenden
+            return AuraFilterDB.secretFallback == "show"
+        end
         return sourceUnit == "player"
 
     elseif mode == "whitelist" then
-        return cfg.whitelist[spellId] ~= nil
+        if spellId == nil then
+            return AuraFilterDB.secretFallback == "show"
+        end
+        return cfg.whitelist[tostring(spellId)] ~= nil
 
     elseif mode == "blacklist" then
-        return cfg.blacklist[spellId] == nil
+        if spellId == nil then
+            return AuraFilterDB.secretFallback == "show"
+        end
+        return cfg.blacklist[tostring(spellId)] == nil
     end
 
     return true
 end
 
--- Iteriert alle Debuffs auf dem Target und blendet unerwünschte aus.
--- Funktioniert mit dem alten TargetFrame-Button-System (Classic-style TargetFrame)
--- sowie dem neueren System via C_UnitAuras.
+-- ---------------------------------------------------------------------------
+-- Debuff-Buttons finden (mehrere mögliche Strukturen in Midnight)
+-- ---------------------------------------------------------------------------
+local function GetDebuffButtons()
+    if not TargetFrame then return nil end
+
+    -- Midnight / TWW: TargetFrame.debuffFrames
+    if TargetFrame.debuffFrames and #TargetFrame.debuffFrames > 0 then
+        return TargetFrame.debuffFrames
+    end
+
+    -- Ältere Struktur: TargetFrameDebuff1..n
+    local buttons = {}
+    for i = 1, 40 do
+        local btn = _G["TargetFrameDebuff"..i]
+        if btn then
+            table.insert(buttons, btn)
+        else
+            break
+        end
+    end
+    if #buttons > 0 then return buttons end
+
+    return nil
+end
+
+-- ---------------------------------------------------------------------------
+-- Haupt-Filter
+-- ---------------------------------------------------------------------------
 local function FilterTargetDebuffs()
-    if not AuraFilterDB.enabled then return end
+    if not AuraFilterDB or not AuraFilterDB.enabled then return end
 
-    -- Neueres API: C_UnitAuras + direktes Iterieren der Debuff-Buttons
-    local frame = TargetFrame
-    if not frame then return end
+    local buttons = GetDebuffButtons()
+    if not buttons then return end
 
-    -- Debuff-Buttons liegen in TargetFrame.debuffFrames (TWW / Midnight)
-    local debuffFrames = frame.debuffFrames
-    if not debuffFrames then return end
+    for i, button in ipairs(buttons) do
+        if not button then break end
 
-    for i, button in ipairs(debuffFrames) do
-        if button and button:IsShown() then
-            local auraData = button.auraData
-            if auraData then
-                local spellId    = auraData.spellId or 0
-                local sourceUnit = auraData.sourceUnit or ""
-                if not ShouldShowDebuff(spellId, sourceUnit) then
-                    button:Hide()
-                end
-            else
-                -- Fallback: button hat kein auraData → über C_UnitAuras nachschlagen
-                local aura = C_UnitAuras.GetAuraDataByIndex("target", i, "HARMFUL")
-                if aura then
-                    local sourceUnit = aura.sourceUnit or ""
-                    local spellId    = aura.spellId or 0
-                    if not ShouldShowDebuff(spellId, sourceUnit) then
-                        button:Hide()
-                    end
-                end
+        -- Button-Sichtbarkeit sicher lesen
+        local isShown
+        pcall(function() isShown = button:IsShown() end)
+        if not isShown then goto continue end
+
+        local spellId, sourceUnit
+
+        -- 1. Versuch: button.auraData (neuere Builds)
+        if button.auraData then
+            spellId    = SafeGet(button.auraData, "spellId")
+            sourceUnit = SafeGet(button.auraData, "sourceUnit")
+
+        -- 2. Versuch: button.auraInstanceID → C_UnitAuras
+        elseif button.auraInstanceID then
+            local ok, aura = pcall(C_UnitAuras.GetAuraDataByAuraInstanceID, "target", button.auraInstanceID)
+            if ok and aura then
+                spellId    = SafeGet(aura, "spellId")
+                sourceUnit = SafeGet(aura, "sourceUnit")
+            end
+
+        -- 3. Versuch: Index-basiert via C_UnitAuras
+        else
+            local ok, aura = pcall(C_UnitAuras.GetAuraDataByIndex, "target", i, "HARMFUL")
+            if ok and aura then
+                spellId    = SafeGet(aura, "spellId")
+                sourceUnit = SafeGet(aura, "sourceUnit")
             end
         end
+
+        if not ShouldShowDebuff(spellId, sourceUnit) then
+            pcall(function() button:Hide() end)
+        end
+
+        ::continue::
     end
 end
 
 -- ---------------------------------------------------------------------------
--- Events
+-- Events & Hooks
 -- ---------------------------------------------------------------------------
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("ADDON_LOADED")
 eventFrame:RegisterEvent("PLAYER_LOGIN")
 eventFrame:RegisterEvent("UNIT_AURA")
+eventFrame:RegisterEvent("PLAYER_TARGET_CHANGED")
 
 eventFrame:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" and arg1 == addonName then
@@ -108,19 +172,19 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
         self:UnregisterEvent("ADDON_LOADED")
 
     elseif event == "PLAYER_LOGIN" then
-        -- Ins Update-System einklinken: nach jedem TargetFrame-Aura-Update filtern
-        if TargetFrame then
-            hooksecurefunc(TargetFrame, "UpdateDebuffs", function()
-                FilterTargetDebuffs()
-            end)
-            -- Fallback: generischer Aura-Update-Hook
-            hooksecurefunc("TargetFrame_UpdateAuras", function()
-                FilterTargetDebuffs()
-            end)
-        end
+        -- Sicher hooken: beide möglichen Funktionen probieren
+        pcall(function()
+            hooksecurefunc(TargetFrame, "UpdateDebuffs", FilterTargetDebuffs)
+        end)
+        pcall(function()
+            hooksecurefunc("TargetFrame_UpdateAuras", FilterTargetDebuffs)
+        end)
         print("|cff00ccff[AuraFilter]|r geladen. |cffffcc00/af help|r für Befehle.")
 
     elseif event == "UNIT_AURA" and arg1 == "target" then
+        FilterTargetDebuffs()
+
+    elseif event == "PLAYER_TARGET_CHANGED" then
         FilterTargetDebuffs()
     end
 end)
@@ -134,11 +198,13 @@ local function PrintHelp()
     print("  |cffffcc00/af mode whitelist|r   – Nur Spells aus der Whitelist zeigen")
     print("  |cffffcc00/af mode blacklist|r   – Alle außer Spells auf der Blacklist")
     print("  |cffffcc00/af mode all|r         – Alle Debuffs zeigen (Filter aus)")
-    print("  |cffffcc00/af white add <ID> [Name]|r  – Spell zur Whitelist hinzufügen")
-    print("  |cffffcc00/af white remove <ID>|r      – Spell aus Whitelist entfernen")
+    print("  |cffffcc00/af secret hide|r      – Secret-Auras verstecken (Standard, Instanzen)")
+    print("  |cffffcc00/af secret show|r      – Secret-Auras trotzdem anzeigen")
+    print("  |cffffcc00/af white add <ID> [Name]|r  – Spell zur Whitelist")
+    print("  |cffffcc00/af white remove <ID>|r      – Spell aus Whitelist")
     print("  |cffffcc00/af white list|r             – Whitelist anzeigen")
-    print("  |cffffcc00/af black add <ID> [Name]|r  – Spell zur Blacklist hinzufügen")
-    print("  |cffffcc00/af black remove <ID>|r      – Spell aus Blacklist entfernen")
+    print("  |cffffcc00/af black add <ID> [Name]|r  – Spell zur Blacklist")
+    print("  |cffffcc00/af black remove <ID>|r      – Spell aus Blacklist")
     print("  |cffffcc00/af black list|r             – Blacklist anzeigen")
     print("  |cffffcc00/af status|r           – Aktuelle Einstellungen")
     print("  |cffffcc00/af enable|r / |cffffcc00disable|r – Addon an/aus")
@@ -147,13 +213,13 @@ end
 local function PrintStatus()
     local cfg = AuraFilterDB.targetDebuffs
     print("|cff00ccff[AuraFilter]|r Status:")
-    print(string.format("  Addon:  %s", AuraFilterDB.enabled and "|cff00ff00Aktiv|r" or "|cffff4444Inaktiv|r"))
-    print(string.format("  Modus:  |cffffcc00%s|r", cfg.mode))
-
+    print(string.format("  Addon:          %s", AuraFilterDB.enabled and "|cff00ff00Aktiv|r" or "|cffff4444Inaktiv|r"))
+    print(string.format("  Modus:          |cffffcc00%s|r", cfg.mode))
+    print(string.format("  Secret-Fallback:|cffffcc00%s|r", AuraFilterDB.secretFallback))
     local wCount, bCount = 0, 0
     for _ in pairs(cfg.whitelist) do wCount = wCount + 1 end
     for _ in pairs(cfg.blacklist) do bCount = bCount + 1 end
-    print(string.format("  Whitelist: %d Einträge | Blacklist: %d Einträge", wCount, bCount))
+    print(string.format("  Whitelist: %d | Blacklist: %d Einträge", wCount, bCount))
 end
 
 local function PrintList(list, label)
@@ -187,23 +253,32 @@ SlashCmdList["AURAFILTER"] = function(msg)
 
     elseif cmd == "disable" then
         AuraFilterDB.enabled = false
-        -- Alle Debuff-Buttons wieder einblenden
-        if TargetFrame and TargetFrame.debuffFrames then
-            for _, btn in ipairs(TargetFrame.debuffFrames) do
-                btn:Show()
+        local buttons = GetDebuffButtons()
+        if buttons then
+            for _, btn in ipairs(buttons) do
+                pcall(function() btn:Show() end)
             end
         end
         print("|cff00ccff[AuraFilter]|r |cffff4444Deaktiviert.|r")
 
+    elseif cmd == "secret" then
+        if sub == "hide" or sub == "show" then
+            AuraFilterDB.secretFallback = sub
+            FilterTargetDebuffs()
+            print(string.format("|cff00ccff[AuraFilter]|r Secret-Fallback: |cffffcc00%s|r", sub))
+        else
+            print("|cff00ccff[AuraFilter]|r /af secret hide|show")
+        end
+
     elseif cmd == "mode" then
         local validModes = { onlyMine=true, whitelist=true, blacklist=true, all=true }
         if not validModes[sub] then
-            print("|cff00ccff[AuraFilter]|r Ungültiger Modus. Erlaubt: onlyMine | whitelist | blacklist | all")
+            print("|cff00ccff[AuraFilter]|r Erlaubt: onlyMine | whitelist | blacklist | all")
             return
         end
         AuraFilterDB.targetDebuffs.mode = sub
         FilterTargetDebuffs()
-        print(string.format("|cff00ccff[AuraFilter]|r Modus gesetzt: |cffffcc00%s|r", sub))
+        print(string.format("|cff00ccff[AuraFilter]|r Modus: |cffffcc00%s|r", sub))
 
     elseif cmd == "white" then
         local cfg = AuraFilterDB.targetDebuffs
@@ -221,7 +296,7 @@ SlashCmdList["AURAFILTER"] = function(msg)
             print(string.format("|cff00ccff[AuraFilter]|r Whitelist –|cffffcc00%d|r", id))
             FilterTargetDebuffs()
         elseif sub == "list" then
-            PrintList(AuraFilterDB.targetDebuffs.whitelist, "Whitelist")
+            PrintList(cfg.whitelist, "Whitelist")
         else
             print("|cff00ccff[AuraFilter]|r /af white add|remove|list")
         end
@@ -242,7 +317,7 @@ SlashCmdList["AURAFILTER"] = function(msg)
             print(string.format("|cff00ccff[AuraFilter]|r Blacklist –|cffffcc00%d|r", id))
             FilterTargetDebuffs()
         elseif sub == "list" then
-            PrintList(AuraFilterDB.targetDebuffs.blacklist, "Blacklist")
+            PrintList(cfg.blacklist, "Blacklist")
         else
             print("|cff00ccff[AuraFilter]|r /af black add|remove|list")
         end

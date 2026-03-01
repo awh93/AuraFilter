@@ -1,7 +1,8 @@
 -- AuraFilter.lua
 -- Filtert Debuffs auf dem Target Frame
 -- Midnight 12.0 kompatibel: pcall um alle Aura-Datenzugriffe (Secret Values)
--- onlyMine nutzt HARMFUL|PLAYER-Filter + auraInstanceID (kein Secret Value)
+-- onlyMine: spiegelt die Nameplate-Debuffs (Blizzards eigene Filterlogik)
+--           Fallback: HARMFUL|PLAYER-Filter + auraInstanceID
 -- Slash: /af  oder  /aurafilter
 
 local addonName, addon = ...
@@ -11,11 +12,11 @@ local addonName, addon = ...
 -- ---------------------------------------------------------------------------
 local defaults = {
     enabled    = true,
-    secretFallback = "hide",   -- Was tun wenn Daten secret sind: "hide" | "show"
+    secretFallback = "hide",
     targetDebuffs = {
         mode      = "onlyMine",  -- "onlyMine" | "whitelist" | "blacklist" | "all"
-        whitelist = {},          -- [spellID] = "Name"  → nur diese zeigen
-        blacklist = {},          -- [spellID] = "Name"  → diese verstecken
+        whitelist = {},
+        blacklist = {},
     },
 }
 
@@ -46,8 +47,45 @@ local function SafeGet(aura, field)
 end
 
 -- ---------------------------------------------------------------------------
--- Midnight: Set aller auraInstanceIDs die vom Spieler stammen
--- auraInstanceID ist KEIN Secret Value → lesbar auch in Midnight
+-- Nameplate mirror: auraInstanceIDs aller sichtbaren Nameplate-Debuffs
+-- Blizzard filtert die Nameplate bereits korrekt → wir spiegeln das einfach.
+-- Scannt rekursiv alle Kinder der Target-Nameplate nach sichtbaren Frames
+-- mit einer auraInstanceID (funktioniert unabhängig von der frame-Struktur).
+-- ---------------------------------------------------------------------------
+local function GetNameplateAuraInstanceIDs()
+    local nameplate = C_NamePlate.GetNamePlateForUnit("target")
+    if not nameplate then return nil end
+
+    local set = {}
+    local found = 0
+
+    local function scan(frame, depth)
+        if depth > 6 then return end
+        local ok, children = pcall(function() return {frame:GetChildren()} end)
+        if not ok then return end
+        for _, child in ipairs(children) do
+            -- auraInstanceID direkt auf dem Frame-Objekt
+            local ok2, iid = pcall(function() return child.auraInstanceID end)
+            if ok2 and iid and type(iid) == "number" then
+                local shown
+                pcall(function() shown = child:IsShown() end)
+                if shown then
+                    set[iid] = true
+                    found = found + 1
+                end
+            end
+            scan(child, depth + 1)
+        end
+    end
+
+    scan(nameplate, 0)
+    if found == 0 then return nil end
+    return set
+end
+
+-- ---------------------------------------------------------------------------
+-- Fallback: HARMFUL|PLAYER instanceID-Set (falls Nameplate nicht verfügbar)
+-- auraInstanceID ist kein Secret Value → auch in Midnight lesbar
 -- ---------------------------------------------------------------------------
 local function GetPlayerAuraInstanceIDs()
     local set = {}
@@ -63,7 +101,7 @@ end
 -- ---------------------------------------------------------------------------
 -- Filter-Entscheidung
 -- ---------------------------------------------------------------------------
-local function ShouldShowDebuff(spellId, sourceUnit, instanceID, playerIDs)
+local function ShouldShowDebuff(spellId, sourceUnit, instanceID, showIDs)
     local cfg  = AuraFilterDB.targetDebuffs
     local mode = cfg.mode
 
@@ -71,11 +109,11 @@ local function ShouldShowDebuff(spellId, sourceUnit, instanceID, playerIDs)
         return true
 
     elseif mode == "onlyMine" then
-        -- Midnight: HARMFUL|PLAYER instanceID-Set → kein Secret-Value-Problem
-        if playerIDs and instanceID then
-            return playerIDs[instanceID] == true
+        -- Primär: Nameplate-Mirror oder HARMFUL|PLAYER-Set
+        if showIDs and instanceID then
+            return showIDs[instanceID] == true
         end
-        -- Fallback für ältere Builds mit lesbarem sourceUnit
+        -- Letzter Fallback: sourceUnit (ältere Builds)
         if sourceUnit == nil then
             return AuraFilterDB.secretFallback == "show"
         end
@@ -98,7 +136,7 @@ local function ShouldShowDebuff(spellId, sourceUnit, instanceID, playerIDs)
 end
 
 -- ---------------------------------------------------------------------------
--- Debuff-Buttons finden
+-- Debuff-Buttons des TargetFrame finden
 -- ---------------------------------------------------------------------------
 local function GetDebuffButtons()
     if not TargetFrame then return nil end
@@ -120,8 +158,8 @@ local function GetDebuffButtons()
     end
     if #buttons > 0 then return buttons end
 
-    -- Midnight 12.0: Debuff-Buttons sind unbenannte direkte Kinder von TargetFrame
-    -- die jeweils ein direktes Kind namens "TargetFrameCooldown" besitzen.
+    -- Midnight 12.0: unbenannte direkte Kinder von TargetFrame
+    -- die ein direktes Kind namens "TargetFrameCooldown" besitzen
     local ok, children = pcall(function() return {TargetFrame:GetChildren()} end)
     if ok then
         for _, child in ipairs(children) do
@@ -154,10 +192,13 @@ local function FilterTargetDebuffs()
     local buttons = GetDebuffButtons()
     if not buttons or #buttons == 0 then return end
 
-    -- Für onlyMine: HARMFUL|PLAYER instanceID-Set aufbauen (umgeht Secret Values)
-    local playerIDs = nil
+    -- Show-Set aufbauen: Nameplate zuerst, dann HARMFUL|PLAYER als Fallback
+    local showIDs = nil
     if cfg.mode == "onlyMine" then
-        playerIDs = GetPlayerAuraInstanceIDs()
+        showIDs = GetNameplateAuraInstanceIDs()
+        if not showIDs then
+            showIDs = GetPlayerAuraInstanceIDs()
+        end
     end
 
     for i, button in ipairs(buttons) do
@@ -169,13 +210,13 @@ local function FilterTargetDebuffs()
         if isShown then
             local spellId, sourceUnit, instanceID
 
-            -- 1. Versuch: button.auraData (neuere Builds)
+            -- 1. button.auraData
             if button.auraData then
                 spellId    = SafeGet(button.auraData, "spellId")
                 sourceUnit = SafeGet(button.auraData, "sourceUnit")
                 instanceID = SafeGet(button.auraData, "auraInstanceID")
 
-            -- 2. Versuch: button.auraInstanceID direkt
+            -- 2. button.auraInstanceID direkt
             elseif button.auraInstanceID then
                 instanceID = button.auraInstanceID
                 local ok, aura = pcall(C_UnitAuras.GetAuraDataByAuraInstanceID, "target", instanceID)
@@ -185,9 +226,7 @@ local function FilterTargetDebuffs()
                 end
             end
 
-            -- 3. Fallback: Index-basiert via C_UnitAuras
-            -- In Midnight liefert GetAuraDataByIndex zwar keine spellId/sourceUnit,
-            -- aber auraInstanceID ist lesbar → reicht für HARMFUL|PLAYER-Vergleich
+            -- 3. Index-basiert (Midnight: auraInstanceID lesbar, rest Secret Value)
             if instanceID == nil then
                 local ok, aura = pcall(C_UnitAuras.GetAuraDataByIndex, "target", i, "HARMFUL")
                 if ok and aura then
@@ -197,7 +236,7 @@ local function FilterTargetDebuffs()
                 end
             end
 
-            if not ShouldShowDebuff(spellId, sourceUnit, instanceID, playerIDs) then
+            if not ShouldShowDebuff(spellId, sourceUnit, instanceID, showIDs) then
                 pcall(function() button:Hide() end)
             end
         end
@@ -220,7 +259,6 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
         self:UnregisterEvent("ADDON_LOADED")
 
     elseif event == "PLAYER_LOGIN" then
-        -- Sicher hooken: beide möglichen Funktionen probieren
         pcall(function()
             hooksecurefunc(TargetFrame, "UpdateDebuffs", FilterTargetDebuffs)
         end)
@@ -242,7 +280,7 @@ end)
 -- ---------------------------------------------------------------------------
 local function PrintHelp()
     print("|cff00ccff[AuraFilter]|r Befehle:")
-    print("  |cffffcc00/af mode onlyMine|r    – Nur eigene Debuffs zeigen (Standard)")
+    print("  |cffffcc00/af mode onlyMine|r    – Nameplate-Debuffs spiegeln (Standard)")
     print("  |cffffcc00/af mode whitelist|r   – Nur Spells aus der Whitelist zeigen")
     print("  |cffffcc00/af mode blacklist|r   – Alle außer Spells auf der Blacklist")
     print("  |cffffcc00/af mode all|r         – Alle Debuffs zeigen (Filter aus)")
@@ -374,63 +412,54 @@ SlashCmdList["AURAFILTER"] = function(msg)
         print("|cff00ccff[AuraFilter]|r === DEBUG ===")
         print("TargetFrame: " .. tostring(TargetFrame ~= nil))
 
-        local df = TargetFrame and TargetFrame.debuffFrames
-        print("TargetFrame.debuffFrames: " .. tostring(df ~= nil)
-            .. (df and (" (Anzahl: "..tostring(#df)..")") or ""))
-        print("TargetFrameDebuff1 (global): " .. tostring(_G["TargetFrameDebuff1"] ~= nil))
+        -- Nameplate prüfen
+        local nameplate = C_NamePlate.GetNamePlateForUnit("target")
+        print("Nameplate für target: " .. tostring(nameplate ~= nil))
+        if nameplate then
+            local npIDs = GetNameplateAuraInstanceIDs()
+            if npIDs then
+                local count = 0
+                local ids = ""
+                for iid in pairs(npIDs) do
+                    count = count + 1
+                    ids = ids .. tostring(iid) .. " "
+                end
+                print("  Nameplate auraInstanceIDs (" .. count .. "): " .. ids)
+            else
+                print("  Keine sichtbaren Auras auf Nameplate gefunden")
+            end
+        end
 
-        -- HARMFUL auras mit beiden Filtern vergleichen
+        -- HARMFUL auras
         local function countAuras(filter)
             local n = 0
             for i = 1, 40 do
                 local ok, a = pcall(C_UnitAuras.GetAuraDataByIndex, "target", i, filter)
                 if not ok or not a then break end
                 n = n + 1
-                local sid  = SafeGet(a, "spellId")
-                local src  = SafeGet(a, "sourceUnit")
-                local name = SafeGet(a, "name")
-                local iid  = SafeGet(a, "auraInstanceID")
-                print(string.format("  [%s] #%d spellId=%s src=%s name=%s instanceID=%s",
-                    filter, i, tostring(sid), tostring(src), tostring(name), tostring(iid)))
+                local iid = SafeGet(a, "auraInstanceID")
+                print(string.format("  [%s] #%d instanceID=%s", filter, i, tostring(iid)))
             end
             return n
         end
-
         local total = countAuras("HARMFUL")
         local mine  = countAuras("HARMFUL|PLAYER")
-        print("HARMFUL total: " .. total .. "  |  HARMFUL|PLAYER (nur eigene): " .. mine)
+        print("HARMFUL total: " .. total .. "  |  HARMFUL|PLAYER: " .. mine)
 
-        -- GetDebuffButtons Ergebnis + Button-Inspektion
+        -- GetDebuffButtons
         local buttons = GetDebuffButtons()
-        print("GetDebuffButtons: " .. (buttons and (tostring(#buttons).." buttons gefunden") or "nil"))
-
+        print("GetDebuffButtons: " .. (buttons and (tostring(#buttons).." gefunden") or "nil"))
         if buttons then
             for i, btn in ipairs(buttons) do
-                local props = {"auraInstanceID", "unit", "filter", "auraIndex", "debuffIndex"}
-                local line = "  btn#"..i..":"
-                for _, prop in ipairs(props) do
-                    local ok, val = pcall(function() return btn[prop] end)
-                    if ok and val ~= nil then
-                        line = line .. " "..prop.."="..tostring(val)
-                    end
-                end
-                -- auraData prüfen
-                local ok2, ad = pcall(function() return btn.auraData end)
-                if ok2 and ad then
-                    local iid = SafeGet(ad, "auraInstanceID")
-                    line = line .. " auraData.instanceID="..tostring(iid)
-                else
-                    line = line .. " auraData=nil"
-                end
-                -- Sichtbarkeit
+                local ok, iid = pcall(function() return btn.auraInstanceID end)
                 local shown
                 pcall(function() shown = btn:IsShown() end)
-                line = line .. " shown="..tostring(shown)
-                print(line)
+                print(string.format("  btn#%d auraInstanceID=%s shown=%s",
+                    i, (ok and tostring(iid) or "err"), tostring(shown)))
             end
         end
 
-        -- TargetFrame Kindframes bis Tiefe 2 auflisten
+        -- TargetFrame children (depth 2)
         print("-- TargetFrame children (depth 2) --")
         local function listChildren(frame, depth)
             if depth > 2 then return end

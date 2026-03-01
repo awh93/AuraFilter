@@ -1,7 +1,7 @@
 -- AuraFilter.lua
 -- Filtert Debuffs auf dem Target Frame
 -- Midnight 12.0 kompatibel: pcall um alle Aura-Datenzugriffe (Secret Values)
--- onlyMine: spiegelt Nameplate-Debuffs (Blizzards Filterlogik), Fallback HARMFUL|PLAYER
+-- onlyMine: HARMFUL|PLAYER-Filter (auraInstanceID ist kein Secret Value)
 -- Slash: /af  oder  /aurafilter
 
 local addonName, addon = ...
@@ -46,7 +46,23 @@ local function SafeGet(aura, field)
 end
 
 -- ---------------------------------------------------------------------------
--- Nameplate mirror: auraInstanceIDs aller sichtbaren Nameplate-Debuffs
+-- HARMFUL|PLAYER instanceID-Set (zuverlässig, kein Frame-Scan nötig)
+-- auraInstanceID ist kein Secret Value → auch in Midnight lesbar
+-- ---------------------------------------------------------------------------
+local function GetPlayerAuraInstanceIDs()
+    local set = {}
+    for i = 1, 40 do
+        local ok, aura = pcall(C_UnitAuras.GetAuraDataByIndex, "target", i, "HARMFUL|PLAYER")
+        if not ok or not aura then break end
+        local iid = SafeGet(aura, "auraInstanceID")
+        if iid and iid > 0 then set[iid] = true end
+    end
+    return set
+end
+
+-- ---------------------------------------------------------------------------
+-- Nameplate mirror (optional, als Zusatzfilter nutzbar)
+-- Scannt die Nameplate-Frame-Kinder nach sichtbaren auraInstanceIDs
 -- ---------------------------------------------------------------------------
 local function GetNameplateAuraInstanceIDs()
     local nameplate = C_NamePlate.GetNamePlateForUnit("target")
@@ -61,10 +77,10 @@ local function GetNameplateAuraInstanceIDs()
         if not ok then return end
         for _, child in ipairs(children) do
             local ok2, iid = pcall(function() return child.auraInstanceID end)
-            if ok2 and iid and type(iid) == "number" then
-                local shown
-                pcall(function() shown = child:IsShown() end)
-                if shown then
+            if ok2 and iid and type(iid) == "number" and iid > 0 then
+                local visible
+                pcall(function() visible = child:IsVisible() end)
+                if visible then
                     set[iid] = true
                     found = found + 1
                 end
@@ -76,52 +92,6 @@ local function GetNameplateAuraInstanceIDs()
     scan(nameplate, 0)
     if found == 0 then return nil end
     return set
-end
-
--- ---------------------------------------------------------------------------
--- Fallback: HARMFUL|PLAYER instanceID-Set
--- ---------------------------------------------------------------------------
-local function GetPlayerAuraInstanceIDs()
-    local set = {}
-    for i = 1, 40 do
-        local ok, aura = pcall(C_UnitAuras.GetAuraDataByIndex, "target", i, "HARMFUL|PLAYER")
-        if not ok or not aura then break end
-        local iid = SafeGet(aura, "auraInstanceID")
-        if iid then set[iid] = true end
-    end
-    return set
-end
-
--- ---------------------------------------------------------------------------
--- Filter-Entscheidung
--- ---------------------------------------------------------------------------
-local function ShouldShowDebuff(spellId, instanceID, showIDs)
-    local cfg  = AuraFilterDB.targetDebuffs
-    local mode = cfg.mode
-
-    if mode == "all" then
-        return true
-
-    elseif mode == "onlyMine" then
-        if showIDs and instanceID then
-            return showIDs[instanceID] == true
-        end
-        return AuraFilterDB.secretFallback == "show"
-
-    elseif mode == "whitelist" then
-        if spellId == nil then
-            return AuraFilterDB.secretFallback == "show"
-        end
-        return cfg.whitelist[tostring(spellId)] ~= nil
-
-    elseif mode == "blacklist" then
-        if spellId == nil then
-            return AuraFilterDB.secretFallback == "show"
-        end
-        return cfg.blacklist[tostring(spellId)] == nil
-    end
-
-    return true
 end
 
 -- ---------------------------------------------------------------------------
@@ -170,7 +140,7 @@ local function GetDebuffButtons()
 end
 
 -- ---------------------------------------------------------------------------
--- Haupt-Filter (läuft verzögert via C_Timer so dass Blizzard zuerst updated)
+-- Haupt-Filter
 -- ---------------------------------------------------------------------------
 local function FilterTargetDebuffsNow()
     if not AuraFilterDB or not AuraFilterDB.enabled then return end
@@ -184,10 +154,12 @@ local function FilterTargetDebuffsNow()
     -- Show-Set aufbauen
     local showIDs = nil
     if cfg.mode == "onlyMine" then
-        showIDs = GetNameplateAuraInstanceIDs()
-        if not showIDs then
-            showIDs = GetPlayerAuraInstanceIDs()
-        end
+        showIDs = GetPlayerAuraInstanceIDs()
+
+        -- Sicherheitsnetz: wenn showIDs leer ist, sind gerade keine Spieler-Debuffs
+        -- aktiv ODER wir befinden uns in einem Übergangs-Frame.
+        -- In beiden Fällen nichts tun — nicht alle Icons verbergen.
+        if not next(showIDs) then return end
     end
 
     for i, button in ipairs(buttons) do
@@ -196,7 +168,7 @@ local function FilterTargetDebuffsNow()
         -- auraInstanceID direkt vom Button lesen (in Midnight bestätigt lesbar)
         local instanceID
         local ok1, val1 = pcall(function() return button.auraInstanceID end)
-        if ok1 and val1 and type(val1) == "number" then
+        if ok1 and type(val1) == "number" and val1 > 0 then
             instanceID = val1
         end
 
@@ -209,21 +181,33 @@ local function FilterTargetDebuffsNow()
         if not instanceID then
             local ok2, aura = pcall(C_UnitAuras.GetAuraDataByIndex, "target", i, "HARMFUL")
             if ok2 and aura then
-                instanceID = SafeGet(aura, "auraInstanceID")
+                local iid = SafeGet(aura, "auraInstanceID")
+                if iid and iid > 0 then instanceID = iid end
             end
         end
 
         if instanceID then
-            -- Button hat eine aktive Aura: explizit show ODER hide setzen.
-            -- Wichtig: wir setzen beides, damit vorherige Filter-Zustände
-            -- immer korrekt überschrieben werden.
-            if ShouldShowDebuff(nil, instanceID, showIDs) then
+            -- Button hat eine aktive Aura: explizit SHOW oder HIDE setzen
+            local shouldShow
+
+            if cfg.mode == "onlyMine" then
+                shouldShow = showIDs[instanceID] == true
+
+            elseif cfg.mode == "whitelist" then
+                -- spellId bleibt nil in Midnight (Secret Value) → fallback
+                shouldShow = (AuraFilterDB.secretFallback == "show")
+
+            elseif cfg.mode == "blacklist" then
+                shouldShow = (AuraFilterDB.secretFallback == "show")
+            end
+
+            if shouldShow then
                 pcall(function() button:Show() end)
             else
                 pcall(function() button:Hide() end)
             end
         end
-        -- instanceID == nil → leerer Slot, Blizzard verwaltet
+        -- instanceID == nil/0 → leerer Slot, Blizzard verwaltet
     end
 end
 
@@ -269,7 +253,7 @@ end)
 -- ---------------------------------------------------------------------------
 local function PrintHelp()
     print("|cff00ccff[AuraFilter]|r Befehle:")
-    print("  |cffffcc00/af mode onlyMine|r    – Nameplate-Debuffs spiegeln (Standard)")
+    print("  |cffffcc00/af mode onlyMine|r    – Nur eigene Debuffs zeigen (Standard)")
     print("  |cffffcc00/af mode whitelist|r   – Nur Spells aus der Whitelist zeigen")
     print("  |cffffcc00/af mode blacklist|r   – Alle außer Spells auf der Blacklist")
     print("  |cffffcc00/af mode all|r         – Alle Debuffs zeigen (Filter aus)")
@@ -328,7 +312,6 @@ SlashCmdList["AURAFILTER"] = function(msg)
 
     elseif cmd == "disable" then
         AuraFilterDB.enabled = false
-        -- Alle Buttons wieder zeigen
         local buttons = GetDebuffButtons()
         if buttons then
             for _, btn in ipairs(buttons) do
@@ -412,27 +395,28 @@ SlashCmdList["AURAFILTER"] = function(msg)
                 for iid in pairs(npIDs) do count = count + 1; ids = ids .. iid .. " " end
                 print("  Nameplate auraInstanceIDs (" .. count .. "): " .. ids)
             else
-                print("  Keine sichtbaren Auras auf Nameplate")
+                print("  Keine sichtbaren Auras auf Nameplate (IsVisible)")
             end
         end
 
-        -- HARMFUL auras
-        local function countAuras(filter)
-            local n = 0
-            for i = 1, 40 do
-                local ok, a = pcall(C_UnitAuras.GetAuraDataByIndex, "target", i, filter)
-                if not ok or not a then break end
-                n = n + 1
-                local iid = SafeGet(a, "auraInstanceID")
-                print(string.format("  [%s] #%d instanceID=%s", filter, i, tostring(iid)))
-            end
-            return n
-        end
-        local total = countAuras("HARMFUL")
-        local mine  = countAuras("HARMFUL|PLAYER")
-        print("HARMFUL total: " .. total .. "  |  HARMFUL|PLAYER: " .. mine)
+        -- HARMFUL|PLAYER
+        local playerIDs = GetPlayerAuraInstanceIDs()
+        local pidStr = ""
+        for iid in pairs(playerIDs) do pidStr = pidStr .. iid .. " " end
+        print("HARMFUL|PLAYER instanceIDs: " .. (next(playerIDs) and pidStr or "(leer)"))
 
-        -- GetDebuffButtons + Button-Inspektion
+        -- HARMFUL total
+        local total = 0
+        for i = 1, 40 do
+            local ok, a = pcall(C_UnitAuras.GetAuraDataByIndex, "target", i, "HARMFUL")
+            if not ok or not a then break end
+            total = total + 1
+            local iid = SafeGet(a, "auraInstanceID")
+            print(string.format("  [HARMFUL] #%d instanceID=%s", i, tostring(iid)))
+        end
+        print("HARMFUL total: " .. total)
+
+        -- GetDebuffButtons
         local buttons = GetDebuffButtons()
         print("GetDebuffButtons: " .. (buttons and (tostring(#buttons).." gefunden") or "nil"))
         if buttons then
@@ -440,8 +424,9 @@ SlashCmdList["AURAFILTER"] = function(msg)
                 local ok, iid = pcall(function() return btn.auraInstanceID end)
                 local shown
                 pcall(function() shown = btn:IsShown() end)
-                print(string.format("  btn#%d auraInstanceID=%s shown=%s",
-                    i, (ok and tostring(iid) or "err"), tostring(shown)))
+                local inPlayer = (ok and iid and playerIDs[iid]) and "YES" or "no"
+                print(string.format("  btn#%d instanceID=%s shown=%s HARMFUL|PLAYER=%s",
+                    i, (ok and tostring(iid) or "err"), tostring(shown), inPlayer))
             end
         end
 

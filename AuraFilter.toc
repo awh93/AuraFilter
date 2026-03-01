@@ -1,0 +1,8 @@
+## Interface: 120001
+## Title: AuraFilter
+## Notes: Filter buffs and debuffs on unit frames – start with Target debuffs
+## Author: YourName
+## Version: 1.0.0
+## SavedVariables: AuraFilterDB
+
+AuraFilter.lua

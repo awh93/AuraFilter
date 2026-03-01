@@ -1,0 +1,5 @@
+# WoW SavedVariables
+*.bak
+*.tmp
+.DS_Store
+Thumbs.db

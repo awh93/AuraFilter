@@ -122,37 +122,36 @@ local function FilterTargetDebuffs()
         -- Button-Sichtbarkeit sicher lesen
         local isShown
         pcall(function() isShown = button:IsShown() end)
-        if not isShown then goto continue end
 
-        local spellId, sourceUnit
+        if isShown then
+            local spellId, sourceUnit
 
-        -- 1. Versuch: button.auraData (neuere Builds)
-        if button.auraData then
-            spellId    = SafeGet(button.auraData, "spellId")
-            sourceUnit = SafeGet(button.auraData, "sourceUnit")
+            -- 1. Versuch: button.auraData (neuere Builds)
+            if button.auraData then
+                spellId    = SafeGet(button.auraData, "spellId")
+                sourceUnit = SafeGet(button.auraData, "sourceUnit")
 
-        -- 2. Versuch: button.auraInstanceID → C_UnitAuras
-        elseif button.auraInstanceID then
-            local ok, aura = pcall(C_UnitAuras.GetAuraDataByAuraInstanceID, "target", button.auraInstanceID)
-            if ok and aura then
-                spellId    = SafeGet(aura, "spellId")
-                sourceUnit = SafeGet(aura, "sourceUnit")
+            -- 2. Versuch: button.auraInstanceID → C_UnitAuras
+            elseif button.auraInstanceID then
+                local ok, aura = pcall(C_UnitAuras.GetAuraDataByAuraInstanceID, "target", button.auraInstanceID)
+                if ok and aura then
+                    spellId    = SafeGet(aura, "spellId")
+                    sourceUnit = SafeGet(aura, "sourceUnit")
+                end
+
+            -- 3. Versuch: Index-basiert via C_UnitAuras
+            else
+                local ok, aura = pcall(C_UnitAuras.GetAuraDataByIndex, "target", i, "HARMFUL")
+                if ok and aura then
+                    spellId    = SafeGet(aura, "spellId")
+                    sourceUnit = SafeGet(aura, "sourceUnit")
+                end
             end
 
-        -- 3. Versuch: Index-basiert via C_UnitAuras
-        else
-            local ok, aura = pcall(C_UnitAuras.GetAuraDataByIndex, "target", i, "HARMFUL")
-            if ok and aura then
-                spellId    = SafeGet(aura, "spellId")
-                sourceUnit = SafeGet(aura, "sourceUnit")
+            if not ShouldShowDebuff(spellId, sourceUnit) then
+                pcall(function() button:Hide() end)
             end
         end
-
-        if not ShouldShowDebuff(spellId, sourceUnit) then
-            pcall(function() button:Hide() end)
-        end
-
-        ::continue::
     end
 end
 

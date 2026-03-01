@@ -322,37 +322,50 @@ SlashCmdList["AURAFILTER"] = function(msg)
         end
 
     elseif cmd == "debug" then
-        -- Zeigt welche Frame-Struktur gefunden wurde und was C_UnitAuras liefert
         print("|cff00ccff[AuraFilter]|r === DEBUG ===")
-
-        -- TargetFrame vorhanden?
         print("TargetFrame: " .. tostring(TargetFrame ~= nil))
 
-        -- debuffFrames?
         local df = TargetFrame and TargetFrame.debuffFrames
         print("TargetFrame.debuffFrames: " .. tostring(df ~= nil)
             .. (df and (" (Anzahl: "..tostring(#df)..")") or ""))
+        print("TargetFrameDebuff1 (global): " .. tostring(_G["TargetFrameDebuff1"] ~= nil))
 
-        -- Legacy globals?
-        local legacy = _G["TargetFrameDebuff1"]
-        print("TargetFrameDebuff1 (global): " .. tostring(legacy ~= nil))
-
-        -- Wie viele HARMFUL auras hat das Target?
-        local count = 0
-        for i = 1, 40 do
-            local ok, aura = pcall(C_UnitAuras.GetAuraDataByIndex, "target", i, "HARMFUL")
-            if not ok or not aura then break end
-            count = count + 1
-            local spellId    = SafeGet(aura, "spellId")
-            local sourceUnit = SafeGet(aura, "sourceUnit")
-            local name       = SafeGet(aura, "name")
-            print(string.format("  Aura %d: spellId=%s source=%s name=%s",
-                i,
-                tostring(spellId),
-                tostring(sourceUnit),
-                tostring(name)))
+        -- HARMFUL auras mit filter "HARMFUL" vs "HARMFUL|PLAYER"
+        local function countAuras(filter)
+            local n = 0
+            for i = 1, 40 do
+                local ok, a = pcall(C_UnitAuras.GetAuraDataByIndex, "target", i, filter)
+                if not ok or not a then break end
+                n = n + 1
+                local sid  = SafeGet(a, "spellId")
+                local src  = SafeGet(a, "sourceUnit")
+                local name = SafeGet(a, "name")
+                local iid  = SafeGet(a, "auraInstanceID")
+                print(string.format("  [%s] #%d spellId=%s src=%s name=%s instanceID=%s",
+                    filter, i, tostring(sid), tostring(src), tostring(name), tostring(iid)))
+            end
+            return n
         end
-        print("Gesamt HARMFUL auras auf Target: " .. count)
+
+        local total  = countAuras("HARMFUL")
+        local mine   = countAuras("HARMFUL|PLAYER")
+        print("HARMFUL total: " .. total .. "  |  HARMFUL|PLAYER (nur eigene): " .. mine)
+
+        -- TargetFrame-Kindframes bis Tiefe 2 auflisten
+        print("-- TargetFrame children (depth 2) --")
+        local function listChildren(frame, depth)
+            if depth > 2 then return end
+            local ok, children = pcall(function() return {frame:GetChildren()} end)
+            if not ok then return end
+            for _, child in ipairs(children) do
+                local cname = (pcall(function() return child:GetName() end)) and child:GetName() or "?"
+                local ctype = (pcall(function() return child:GetObjectType() end)) and child:GetObjectType() or "?"
+                print(string.rep("  ", depth) .. tostring(cname) .. " [" .. tostring(ctype) .. "]")
+                listChildren(child, depth + 1)
+            end
+        end
+        if TargetFrame then listChildren(TargetFrame, 0) end
+
         print("|cff00ccff[AuraFilter]|r === END DEBUG ===")
 
     else

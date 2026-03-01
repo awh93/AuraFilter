@@ -1,6 +1,7 @@
 -- AuraFilter.lua
 -- Filtert Debuffs auf dem Target Frame
 -- Midnight 12.0 kompatibel: pcall um alle Aura-Datenzugriffe (Secret Values)
+-- onlyMine nutzt HARMFUL|PLAYER-Filter + auraInstanceID (kein Secret Value)
 -- Slash: /af  oder  /aurafilter
 
 local addonName, addon = ...
@@ -34,13 +35,9 @@ end
 -- ---------------------------------------------------------------------------
 -- Sicheres Lesen von Aura-Feldern (Secret Values → pcall)
 -- ---------------------------------------------------------------------------
-
--- Liest einen Wert sicher aus einer Aura-Tabelle.
--- Gibt nil zurück wenn der Wert ein Secret ist.
 local function SafeGet(aura, field)
     local ok, val = pcall(function() return aura[field] end)
     if not ok then return nil end
-    -- Secret Values sind kein string/number → noch mal prüfen
     local ok2 = pcall(function()
         local _ = tostring(val) == tostring(val)
     end)
@@ -49,9 +46,24 @@ local function SafeGet(aura, field)
 end
 
 -- ---------------------------------------------------------------------------
+-- Midnight: Set aller auraInstanceIDs die vom Spieler stammen
+-- auraInstanceID ist KEIN Secret Value → lesbar auch in Midnight
+-- ---------------------------------------------------------------------------
+local function GetPlayerAuraInstanceIDs()
+    local set = {}
+    for i = 1, 40 do
+        local ok, aura = pcall(C_UnitAuras.GetAuraDataByIndex, "target", i, "HARMFUL|PLAYER")
+        if not ok or not aura then break end
+        local iid = SafeGet(aura, "auraInstanceID")
+        if iid then set[iid] = true end
+    end
+    return set
+end
+
+-- ---------------------------------------------------------------------------
 -- Filter-Entscheidung
 -- ---------------------------------------------------------------------------
-local function ShouldShowDebuff(spellId, sourceUnit)
+local function ShouldShowDebuff(spellId, sourceUnit, instanceID, playerIDs)
     local cfg  = AuraFilterDB.targetDebuffs
     local mode = cfg.mode
 
@@ -59,8 +71,12 @@ local function ShouldShowDebuff(spellId, sourceUnit)
         return true
 
     elseif mode == "onlyMine" then
+        -- Midnight: HARMFUL|PLAYER instanceID-Set → kein Secret-Value-Problem
+        if playerIDs and instanceID then
+            return playerIDs[instanceID] == true
+        end
+        -- Fallback für ältere Builds mit lesbarem sourceUnit
         if sourceUnit == nil then
-            -- Secret → Fallback-Einstellung anwenden
             return AuraFilterDB.secretFallback == "show"
         end
         return sourceUnit == "player"
@@ -82,17 +98,17 @@ local function ShouldShowDebuff(spellId, sourceUnit)
 end
 
 -- ---------------------------------------------------------------------------
--- Debuff-Buttons finden (mehrere mögliche Strukturen in Midnight)
+-- Debuff-Buttons finden
 -- ---------------------------------------------------------------------------
 local function GetDebuffButtons()
     if not TargetFrame then return nil end
 
-    -- Midnight / TWW: TargetFrame.debuffFrames
+    -- Classic / TWW: TargetFrame.debuffFrames
     if TargetFrame.debuffFrames and #TargetFrame.debuffFrames > 0 then
         return TargetFrame.debuffFrames
     end
 
-    -- Ältere Struktur: TargetFrameDebuff1..n
+    -- Legacy globals: TargetFrameDebuff1..n
     local buttons = {}
     for i = 1, 40 do
         local btn = _G["TargetFrameDebuff"..i]
@@ -100,6 +116,25 @@ local function GetDebuffButtons()
             table.insert(buttons, btn)
         else
             break
+        end
+    end
+    if #buttons > 0 then return buttons end
+
+    -- Midnight 12.0: Debuff-Buttons sind unbenannte direkte Kinder von TargetFrame
+    -- die jeweils ein direktes Kind namens "TargetFrameCooldown" besitzen.
+    local ok, children = pcall(function() return {TargetFrame:GetChildren()} end)
+    if ok then
+        for _, child in ipairs(children) do
+            local ok2, gcs = pcall(function() return {child:GetChildren()} end)
+            if ok2 then
+                for _, gc in ipairs(gcs) do
+                    local ok3, gcName = pcall(function() return gc:GetName() end)
+                    if ok3 and gcName and gcName == "TargetFrameCooldown" then
+                        table.insert(buttons, child)
+                        break
+                    end
+                end
+            end
         end
     end
     if #buttons > 0 then return buttons end
@@ -113,42 +148,56 @@ end
 local function FilterTargetDebuffs()
     if not AuraFilterDB or not AuraFilterDB.enabled then return end
 
+    local cfg = AuraFilterDB.targetDebuffs
+    if cfg.mode == "all" then return end
+
     local buttons = GetDebuffButtons()
-    if not buttons then return end
+    if not buttons or #buttons == 0 then return end
+
+    -- Für onlyMine: HARMFUL|PLAYER instanceID-Set aufbauen (umgeht Secret Values)
+    local playerIDs = nil
+    if cfg.mode == "onlyMine" then
+        playerIDs = GetPlayerAuraInstanceIDs()
+    end
 
     for i, button in ipairs(buttons) do
         if not button then break end
 
-        -- Button-Sichtbarkeit sicher lesen
         local isShown
         pcall(function() isShown = button:IsShown() end)
 
         if isShown then
-            local spellId, sourceUnit
+            local spellId, sourceUnit, instanceID
 
             -- 1. Versuch: button.auraData (neuere Builds)
             if button.auraData then
                 spellId    = SafeGet(button.auraData, "spellId")
                 sourceUnit = SafeGet(button.auraData, "sourceUnit")
+                instanceID = SafeGet(button.auraData, "auraInstanceID")
 
-            -- 2. Versuch: button.auraInstanceID → C_UnitAuras
+            -- 2. Versuch: button.auraInstanceID direkt
             elseif button.auraInstanceID then
-                local ok, aura = pcall(C_UnitAuras.GetAuraDataByAuraInstanceID, "target", button.auraInstanceID)
-                if ok and aura then
-                    spellId    = SafeGet(aura, "spellId")
-                    sourceUnit = SafeGet(aura, "sourceUnit")
-                end
-
-            -- 3. Versuch: Index-basiert via C_UnitAuras
-            else
-                local ok, aura = pcall(C_UnitAuras.GetAuraDataByIndex, "target", i, "HARMFUL")
+                instanceID = button.auraInstanceID
+                local ok, aura = pcall(C_UnitAuras.GetAuraDataByAuraInstanceID, "target", instanceID)
                 if ok and aura then
                     spellId    = SafeGet(aura, "spellId")
                     sourceUnit = SafeGet(aura, "sourceUnit")
                 end
             end
 
-            if not ShouldShowDebuff(spellId, sourceUnit) then
+            -- 3. Fallback: Index-basiert via C_UnitAuras
+            -- In Midnight liefert GetAuraDataByIndex zwar keine spellId/sourceUnit,
+            -- aber auraInstanceID ist lesbar → reicht für HARMFUL|PLAYER-Vergleich
+            if instanceID == nil then
+                local ok, aura = pcall(C_UnitAuras.GetAuraDataByIndex, "target", i, "HARMFUL")
+                if ok and aura then
+                    spellId    = SafeGet(aura, "spellId")
+                    sourceUnit = SafeGet(aura, "sourceUnit")
+                    instanceID = SafeGet(aura, "auraInstanceID")
+                end
+            end
+
+            if not ShouldShowDebuff(spellId, sourceUnit, instanceID, playerIDs) then
                 pcall(function() button:Hide() end)
             end
         end
@@ -197,7 +246,7 @@ local function PrintHelp()
     print("  |cffffcc00/af mode whitelist|r   – Nur Spells aus der Whitelist zeigen")
     print("  |cffffcc00/af mode blacklist|r   – Alle außer Spells auf der Blacklist")
     print("  |cffffcc00/af mode all|r         – Alle Debuffs zeigen (Filter aus)")
-    print("  |cffffcc00/af secret hide|r      – Secret-Auras verstecken (Standard, Instanzen)")
+    print("  |cffffcc00/af secret hide|r      – Secret-Auras verstecken (Standard)")
     print("  |cffffcc00/af secret show|r      – Secret-Auras trotzdem anzeigen")
     print("  |cffffcc00/af white add <ID> [Name]|r  – Spell zur Whitelist")
     print("  |cffffcc00/af white remove <ID>|r      – Spell aus Whitelist")
@@ -330,7 +379,7 @@ SlashCmdList["AURAFILTER"] = function(msg)
             .. (df and (" (Anzahl: "..tostring(#df)..")") or ""))
         print("TargetFrameDebuff1 (global): " .. tostring(_G["TargetFrameDebuff1"] ~= nil))
 
-        -- HARMFUL auras mit filter "HARMFUL" vs "HARMFUL|PLAYER"
+        -- HARMFUL auras mit beiden Filtern vergleichen
         local function countAuras(filter)
             local n = 0
             for i = 1, 40 do
@@ -347,11 +396,41 @@ SlashCmdList["AURAFILTER"] = function(msg)
             return n
         end
 
-        local total  = countAuras("HARMFUL")
-        local mine   = countAuras("HARMFUL|PLAYER")
+        local total = countAuras("HARMFUL")
+        local mine  = countAuras("HARMFUL|PLAYER")
         print("HARMFUL total: " .. total .. "  |  HARMFUL|PLAYER (nur eigene): " .. mine)
 
-        -- TargetFrame-Kindframes bis Tiefe 2 auflisten
+        -- GetDebuffButtons Ergebnis + Button-Inspektion
+        local buttons = GetDebuffButtons()
+        print("GetDebuffButtons: " .. (buttons and (tostring(#buttons).." buttons gefunden") or "nil"))
+
+        if buttons then
+            for i, btn in ipairs(buttons) do
+                local props = {"auraInstanceID", "unit", "filter", "auraIndex", "debuffIndex"}
+                local line = "  btn#"..i..":"
+                for _, prop in ipairs(props) do
+                    local ok, val = pcall(function() return btn[prop] end)
+                    if ok and val ~= nil then
+                        line = line .. " "..prop.."="..tostring(val)
+                    end
+                end
+                -- auraData prüfen
+                local ok2, ad = pcall(function() return btn.auraData end)
+                if ok2 and ad then
+                    local iid = SafeGet(ad, "auraInstanceID")
+                    line = line .. " auraData.instanceID="..tostring(iid)
+                else
+                    line = line .. " auraData=nil"
+                end
+                -- Sichtbarkeit
+                local shown
+                pcall(function() shown = btn:IsShown() end)
+                line = line .. " shown="..tostring(shown)
+                print(line)
+            end
+        end
+
+        -- TargetFrame Kindframes bis Tiefe 2 auflisten
         print("-- TargetFrame children (depth 2) --")
         local function listChildren(frame, depth)
             if depth > 2 then return end

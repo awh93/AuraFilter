@@ -322,6 +322,40 @@ SlashCmdList["AURAFILTER"] = function(msg)
             print("|cff00ccff[AuraFilter]|r /af black add|remove|list")
         end
 
+    elseif cmd == "debug" then
+        -- Zeigt welche Frame-Struktur gefunden wurde und was C_UnitAuras liefert
+        print("|cff00ccff[AuraFilter]|r === DEBUG ===")
+
+        -- TargetFrame vorhanden?
+        print("TargetFrame: " .. tostring(TargetFrame ~= nil))
+
+        -- debuffFrames?
+        local df = TargetFrame and TargetFrame.debuffFrames
+        print("TargetFrame.debuffFrames: " .. tostring(df ~= nil)
+            .. (df and (" (Anzahl: "..tostring(#df)..")") or ""))
+
+        -- Legacy globals?
+        local legacy = _G["TargetFrameDebuff1"]
+        print("TargetFrameDebuff1 (global): " .. tostring(legacy ~= nil))
+
+        -- Wie viele HARMFUL auras hat das Target?
+        local count = 0
+        for i = 1, 40 do
+            local ok, aura = pcall(C_UnitAuras.GetAuraDataByIndex, "target", i, "HARMFUL")
+            if not ok or not aura then break end
+            count = count + 1
+            local spellId    = SafeGet(aura, "spellId")
+            local sourceUnit = SafeGet(aura, "sourceUnit")
+            local name       = SafeGet(aura, "name")
+            print(string.format("  Aura %d: spellId=%s source=%s name=%s",
+                i,
+                tostring(spellId),
+                tostring(sourceUnit),
+                tostring(name)))
+        end
+        print("Gesamt HARMFUL auras auf Target: " .. count)
+        print("|cff00ccff[AuraFilter]|r === END DEBUG ===")
+
     else
         print("|cff00ccff[AuraFilter]|r Unbekannter Befehl. |cffffcc00/af help|r")
     end
